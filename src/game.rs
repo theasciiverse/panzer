@@ -172,7 +172,6 @@ impl Game {
                 self.sounds(audio);
                 match self.world.outcome() {
                     Some(true) => {
-                        self.gone.clear();
                         self.bonus = (self.mission + 1) % BONUS_EVERY == 0 && self.mission + 1 < self.missions.len();
                         if self.bonus {
                             self.lives += 1;
@@ -211,6 +210,7 @@ impl Game {
                         self.set_phase(Phase::Over);
                     } else {
                         self.mission += 1;
+                        self.gone.clear();
                         self.begin_mission();
                     }
                 }
