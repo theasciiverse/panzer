@@ -1,0 +1,23 @@
+[package]
+name = "panzer"
+version = "0.1.0"
+edition = "2021"
+description = "Asciiverse top-down toy tank combat with ricochets, mines and adaptive music, Rust + Ratatui"
+
+[[bin]]
+name = "panzer"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+log = "0.4"
+env_logger = "0.11"
+rodio = { version = "0.22", default-features = false, features = ["playback"] }
+gilrs = { version = "0.11", optional = true }
+
+[features]
+default = ["gamepad"]
+gamepad = ["dep:gilrs"]
+
+[profile.release]
+debug = 1
