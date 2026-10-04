@@ -69,8 +69,8 @@ const SHELL: f32 = 3.8;
 const ROCKET: f32 = 7.2;
 
 /// 0 is the player; 1-9 are the enemy roster in order of menace, and the
-/// digits in the mission maps.
-pub static SPECS: [Spec; 10] = [
+/// digits in the mission maps; 10 is the second player.
+pub static SPECS: [Spec; 11] = [
     Spec {
         name: "You",
         blurb: "",
@@ -291,6 +291,28 @@ pub static SPECS: [Spec; 10] = [
         invisible: false,
         noise: 0.03,
     },
+    Spec {
+        name: "Player 2",
+        blurb: "",
+        body: (204, 52, 46),
+        turret: (236, 92, 80),
+        speed: 1.95,
+        turn: 9.0,
+        turret_rate: 14.0,
+        reload: (0.12, 0.12),
+        max_shells: 5,
+        shell_speed: SHELL,
+        bounces: 1,
+        rocket: false,
+        burst: 1,
+        mines: 0.0,
+        max_mines: 2,
+        moves: Move::Still,
+        aim: Aim::Direct,
+        dodge: 0.0,
+        invisible: false,
+        noise: 0.0,
+    },
 ];
 
 pub struct Brain {
@@ -341,8 +363,17 @@ pub struct Decision {
 pub fn think(w: &World, b: &mut Brain, i: usize, dt: f32) -> Decision {
     let me = &w.tanks[i];
     let spec = me.spec();
-    let p = &w.tanks[0];
+    // go for the nearest player still in the fight
+    let target = (0..w.players)
+        .filter(|&j| w.tanks[j].alive)
+        .min_by(|&a, &b| {
+            let d = |j: usize| (w.tanks[j].x - me.x).hypot(w.tanks[j].y - me.y);
+            d(a).total_cmp(&d(b))
+        })
+        .unwrap_or(0);
+    let p = &w.tanks[target];
     let hunting = p.alive && w.won_t.is_none();
+    let at_player = |hit: Option<usize>| hit.is_some_and(|j| w.is_player(j));
     let (dx, dy) = (p.x - me.x, p.y - me.y);
     let to_p = dy.atan2(dx);
     let dist = dx.hypot(dy);
@@ -384,7 +415,7 @@ pub fn think(w: &World, b: &mut Brain, i: usize, dt: f32) -> Decision {
     let mut fire = false;
     if hunting && me.cooldown <= 0.0 && me.burst == 0 && w.shells_of(i) < spec.max_shells && b.hesitate <= 0.0 {
         let (mx, my) = (me.x, me.y);
-        if w.trace(mx, my, me.turret, spec.bounces, i, 30.0) == Some(0) {
+        if at_player(w.trace(mx, my, me.turret, spec.bounces, i, 30.0)) {
             fire = true;
         } else if spec.aim == Aim::Direct && wrap(me.turret - aim).abs() < 0.08 && dist < 9.0 && w.trace(mx, my, me.turret, spec.bounces, i, 30.0).is_none() {
             // a speculative shot down a clear line (leading a moving target)
@@ -417,7 +448,7 @@ pub fn think(w: &World, b: &mut Brain, i: usize, dt: f32) -> Decision {
         Move::Chase(stop) => {
             if !hunting {
                 mv = wander(w, b, i, dt, 2, 6, (2.0, 4.0)).unwrap_or_default();
-            } else if steps > stop || w.trace(me.x, me.y, to_p, 0, i, 30.0) != Some(0) {
+            } else if steps > stop || !at_player(w.trace(me.x, me.y, to_p, 0, i, 30.0)) {
                 mv = w.flow(pf, me.x, me.y, false).unwrap_or_default();
             } else {
                 mv = strafe;
@@ -479,7 +510,7 @@ pub fn think(w: &World, b: &mut Brain, i: usize, dt: f32) -> Decision {
             }
         }
         // and of each other
-        for (j, o) in w.tanks.iter().enumerate().skip(1) {
+        for (j, o) in w.tanks.iter().enumerate().skip(w.players) {
             if j == i || !o.alive {
                 continue;
             }
@@ -500,7 +531,7 @@ pub fn think(w: &World, b: &mut Brain, i: usize, dt: f32) -> Decision {
     let mut mine = false;
     if spec.max_mines > 0 && hunting && w.mines_of(i) < spec.max_mines && b.rng.f32() < spec.mines * dt {
         let near_mine = w.mines.iter().any(|m| (m.x - me.x).hypot(m.y - me.y) < 3.0);
-        let near_friend = w.tanks.iter().enumerate().skip(1).any(|(j, o)| j != i && o.alive && (o.x - me.x).hypot(o.y - me.y) < 2.5);
+        let near_friend = w.tanks.iter().enumerate().skip(w.players).any(|(j, o)| j != i && o.alive && (o.x - me.x).hypot(o.y - me.y) < 2.5);
         mine = !near_mine && !near_friend && dist < 9.0 && dist > 2.0;
     }
 
@@ -541,7 +572,7 @@ fn bank_shot(w: &World, i: usize, current: f32) -> Option<f32> {
     let mut best: Option<(f32, f32)> = None;
     for k in 0..N {
         let a = k as f32 * TAU / N as f32 - PI;
-        if w.trace(me.x, me.y, a, spec.bounces, i, 34.0) == Some(0) {
+        if w.trace(me.x, me.y, a, spec.bounces, i, 34.0).is_some_and(|j| w.is_player(j)) {
             let d = wrap(a - current).abs();
             if best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((a, d));

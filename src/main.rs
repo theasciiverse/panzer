@@ -3,10 +3,13 @@ mod arena;
 mod audio;
 mod game;
 mod input;
+mod lan;
+mod net;
+mod proto;
 mod render;
 mod world;
 
-use game::{Game, Phase, DT};
+use game::{Game, Phase, Start, DT};
 use input::Input;
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use ratatui::crossterm::execute;
@@ -23,10 +26,34 @@ fn main() -> io::Result<()> {
     env_logger::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("panzer [--mute] [--mission N]\n\nToy tank combat in the terminal. In game, H shows the controls.");
+        println!(
+            "panzer [--mute] [--mission N | --host | --join [ID]]\n\n\
+             Toy tank combat in the terminal. In game, H shows the controls.\n\
+             --host       host a two-player game on the local network\n\
+             --join       look for games on the local network\n\
+             --join ID    join a host by its iroh id (works across the internet)"
+        );
         return Ok(());
     }
-    let start = args.iter().position(|a| a == "--mission").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok()).map(|n| n.max(1) - 1);
+    let arg_after = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).filter(|v| !v.starts_with("--"));
+    let start = if args.iter().any(|a| a == "--host") {
+        Start::Host
+    } else if args.iter().any(|a| a == "--join") {
+        match arg_after("--join") {
+            Some(id) => match id.parse::<iroh::EndpointId>() {
+                Ok(id) => Start::Join(iroh::EndpointAddr::new(id)),
+                Err(e) => {
+                    eprintln!("not an iroh id: {id}: {e}");
+                    std::process::exit(2);
+                }
+            },
+            None => Start::Browse,
+        }
+    } else if let Some(n) = arg_after("--mission").and_then(|v| v.parse::<usize>().ok()) {
+        Start::Mission(n.max(1) - 1)
+    } else {
+        Start::Title
+    };
     // open audio before the alternate screen, so any ALSA chatter lands above it
     let mut audio = audio::Audio::new(args.iter().any(|a| a == "--mute"));
     log::info!("audio available {} muted {}", audio.available(), audio.muted);
@@ -92,7 +119,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, game: &mut Game, input: &mut Inp
         if snapshot.elapsed() >= SNAPSHOT_EVERY {
             snapshot = Instant::now();
             let w = &game.world;
-            let p = &w.tanks[0];
+            let p = &w.tanks[game.me.min(w.tanks.len() - 1)];
             if game.phase == Phase::Play {
                 log::debug!(
                     "snapshot mission {} lives {} t {:.1} player ({:.2},{:.2}) alive {} turret {:.2} enemies {} shells {} mines {}",

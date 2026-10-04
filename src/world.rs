@@ -3,6 +3,7 @@
 
 use crate::ai::{self, Brain, Spec};
 use crate::arena::{Arena, Mission, Tile, GH, GW};
+use serde::{Deserialize, Serialize};
 use std::f32::consts::{PI, TAU};
 
 pub const TANK_R: f32 = 0.4;
@@ -11,6 +12,8 @@ pub const MINE_FUSE: f32 = 10.0;
 pub const MINE_RADIUS: f32 = 1.6;
 /// Floor stain resolution, cells per tile.
 pub const STAIN: usize = 8;
+/// Roster kind of the second player's tank.
+pub const P2_KIND: usize = 10;
 /// Shells cannot hit the tank that fired them this soon.
 const OWNER_GRACE: f32 = 0.22;
 const FIELD_EVERY: f32 = 0.25;
@@ -130,21 +133,67 @@ pub struct Blast {
     pub radius: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Something that happened, for sounds and for the effects that go with it.
+/// A guest machine receives these from the host and replays the effects.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
-    Shot { rocket: bool },
-    Bounce,
-    Fizzle,
-    Cancel,
-    Empty,
-    TankDown { kind: usize },
+    Shot { rocket: bool, x: f32, y: f32, angle: f32 },
+    Bounce { x: f32, y: f32 },
+    Fizzle { x: f32, y: f32 },
+    Cancel { x: f32, y: f32 },
+    /// Out of shells; only the player who pressed fire hears the click.
+    Empty { who: u8 },
+    TankDown { kind: usize, x: f32, y: f32 },
     MineSet,
     MineBeep,
-    MineBoom,
-    CrateBroken,
+    MineBoom { x: f32, y: f32 },
+    CrateBroken { tx: i32, ty: i32 },
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+/// What a guest needs each tick to draw the battle the host is running.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub time: f32,
+    pub tanks: Vec<TankState>,
+    pub shells: Vec<ShellState>,
+    pub mines: Vec<MineState>,
+    pub events: Vec<Event>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct TankState {
+    pub kind: u8,
+    pub alive: bool,
+    pub x: f32,
+    pub y: f32,
+    pub heading: f32,
+    pub turret: f32,
+    pub speed: f32,
+    pub odometer: f32,
+    pub muzzle: f32,
+    pub reveal: f32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ShellState {
+    pub id: u32,
+    pub owner: u8,
+    pub rocket: bool,
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct MineState {
+    pub owner: u8,
+    pub x: f32,
+    pub y: f32,
+    pub fuse: f32,
+}
+
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
 pub struct Controls {
     /// Desired direction of travel (x right, y down), length up to 1.
     pub mv: (f32, f32),
@@ -159,6 +208,8 @@ pub struct Controls {
 
 pub struct World {
     pub arena: Arena,
+    /// The first `players` tanks are people, the rest the enemy.
+    pub players: usize,
     pub tanks: Vec<Tank>,
     brains: Vec<Brain>,
     pub shells: Vec<Shell>,
@@ -171,7 +222,7 @@ pub struct World {
     pub events: Vec<Event>,
     pub time: f32,
     pub rng: Rng,
-    /// Steps to the player from every tile (u16::MAX: unreachable).
+    /// Steps to the nearest player from every tile (u16::MAX: unreachable).
     pub player_field: Vec<u16>,
     field_t: f32,
     fade_t: f32,
@@ -184,8 +235,9 @@ pub struct World {
 }
 
 impl World {
-    /// A battle on `mission`, without the enemies whose spawn index is in `gone`.
-    pub fn new(mission: &Mission, gone: &[usize], seed: u64) -> World {
+    /// A battle on `mission` for `players` (1 or 2), without the enemies whose
+    /// spawn index is in `gone`.
+    pub fn new(mission: &Mission, gone: &[usize], seed: u64, players: usize) -> World {
         let mut tanks = vec![Tank {
             kind: 0,
             x: mission.player.0,
@@ -205,6 +257,10 @@ impl World {
             burst_t: 0.0,
             spawn: usize::MAX,
         }];
+        if players > 1 {
+            let (x, y) = second_spawn(mission);
+            tanks.push(Tank { kind: P2_KIND, x, y, ..tanks[0].clone() });
+        }
         let mut rng = Rng::new(seed);
         for (i, &(kind, x, y)) in mission.enemies.iter().enumerate() {
             if gone.contains(&i) {
@@ -215,10 +271,14 @@ impl World {
             let heading = (face / (PI / 2.0)).round() * (PI / 2.0);
             tanks.push(Tank { kind, x, y, heading, turret: face, spawn: i, cooldown: rng.range(1.0, 2.0), ..tanks[0].clone() });
         }
+        for t in &mut tanks[..players] {
+            t.spawn = usize::MAX;
+        }
         let brains = (0..tanks.len()).map(|i| Brain::new(seed.wrapping_add(i as u64 * 7919))).collect();
         let n = GW * STAIN * GH * STAIN;
         let mut w = World {
             arena: mission.arena.clone(),
+            players: players.max(1),
             tanks,
             brains,
             shells: Vec::new(),
@@ -239,12 +299,29 @@ impl World {
             kills: Vec::new(),
             pending_mines: Vec::new(),
         };
-        w.player_field = w.field_from((mission.player.0 as i32, mission.player.1 as i32));
+        w.player_field = w.player_field();
         w
     }
 
+    pub fn is_player(&self, i: usize) -> bool {
+        i < self.players
+    }
+
+    pub fn enemies(&self) -> &[Tank] {
+        &self.tanks[self.players..]
+    }
+
     pub fn enemies_left(&self) -> usize {
-        self.tanks[1..].iter().filter(|t| t.alive).count()
+        self.enemies().iter().filter(|t| t.alive).count()
+    }
+
+    pub fn players_alive(&self) -> usize {
+        self.tanks[..self.players].iter().filter(|t| t.alive).count()
+    }
+
+    fn player_field(&self) -> Vec<u16> {
+        let goals: Vec<(i32, i32)> = self.tanks[..self.players].iter().filter(|t| t.alive).map(|t| (t.x as i32, t.y as i32)).collect();
+        self.field_from_many(&goals)
     }
 
     pub fn shells_of(&self, owner: usize) -> usize {
@@ -270,13 +347,18 @@ impl World {
 
     /// Breadth-first steps to `goal` from every tile, 8-way without cutting corners.
     pub fn field_from(&self, goal: (i32, i32)) -> Vec<u16> {
+        self.field_from_many(&[goal])
+    }
+
+    pub fn field_from_many(&self, goals: &[(i32, i32)]) -> Vec<u16> {
         let mut f = vec![u16::MAX; GW * GH];
-        if !self.arena.walkable(goal.0, goal.1) {
-            return f;
-        }
         let mut q = std::collections::VecDeque::new();
-        f[goal.1 as usize * GW + goal.0 as usize] = 0;
-        q.push_back(goal);
+        for &goal in goals {
+            if self.arena.walkable(goal.0, goal.1) {
+                f[goal.1 as usize * GW + goal.0 as usize] = 0;
+                q.push_back(goal);
+            }
+        }
         while let Some((x, y)) = q.pop_front() {
             let d = f[y as usize * GW + x as usize];
             for (dx, dy) in NEIGHBOURS {
@@ -390,7 +472,8 @@ impl World {
 
     // ----------------------------------------------------------------- step
 
-    pub fn step(&mut self, dt: f32, c: Controls) {
+    /// One tick; `controls[i]` drives player `i`.
+    pub fn step(&mut self, dt: f32, controls: &[Controls]) {
         self.time += dt;
         if let Some(t) = &mut self.won_t {
             *t += dt;
@@ -398,16 +481,20 @@ impl World {
         if let Some(t) = &mut self.lost_t {
             *t += dt;
         }
-        // the player
-        if self.tanks[0].alive {
-            self.drive(0, c.mv, dt);
-            let p = &self.tanks[0];
+        // the players
+        for i in 0..self.players {
+            let c = controls.get(i).copied().unwrap_or_default();
+            if !self.tanks[i].alive {
+                continue;
+            }
+            self.drive(i, c.mv, dt);
+            let p = &self.tanks[i];
             let want = match (c.aim_at, c.aim_dir) {
                 (_, Some(a)) => Some(a),
                 (Some((ax, ay)), None) => Some((ay - p.y).atan2(ax - p.x)),
                 _ => None,
             };
-            let p = &mut self.tanks[0];
+            let p = &mut self.tanks[i];
             if let Some(a) = want {
                 let d = wrap(a - p.turret);
                 let step = 14.0 * dt;
@@ -415,21 +502,20 @@ impl World {
             }
             p.turret = wrap(p.turret + c.turret_turn * 2.2 * dt);
             if c.fire {
-                self.try_fire(0);
+                self.try_fire(i);
             }
             if c.mine {
-                self.try_mine(0);
+                self.try_mine(i);
             }
         }
         // the enemies
         self.field_t -= dt;
         if self.field_t <= 0.0 {
             self.field_t = FIELD_EVERY;
-            let p = &self.tanks[0];
-            self.player_field = self.field_from((p.x as i32, p.y as i32));
+            self.player_field = self.player_field();
         }
         let mut brains = std::mem::take(&mut self.brains);
-        for i in 1..self.tanks.len() {
+        for i in self.players..self.tanks.len() {
             if !self.tanks[i].alive {
                 continue;
             }
@@ -463,14 +549,15 @@ impl World {
         }
         self.separate_tanks();
         self.update_shells(dt);
+        self.trails(dt);
         self.update_mines(dt);
         self.update_effects(dt);
         // outcome
-        if !self.tanks[0].alive && self.lost_t.is_none() {
+        if self.players_alive() == 0 && self.lost_t.is_none() {
             self.lost_t = Some(0.0);
-            log::info!("player destroyed at {:.1}s", self.time);
+            log::info!("all players destroyed at {:.1}s", self.time);
         }
-        if self.tanks[0].alive && self.won_t.is_none() && self.enemies_left() == 0 {
+        if self.players_alive() > 0 && self.won_t.is_none() && self.enemies_left() == 0 {
             self.won_t = Some(0.0);
             log::info!("mission cleared at {:.1}s", self.time);
         }
@@ -507,6 +594,12 @@ impl World {
         t.vy = (t.y - oy) / dt;
         t.speed = (moved / dt / spec.speed).min(1.0);
         t.odometer += moved * dir;
+        self.stamp_tracks(i);
+    }
+
+    /// Tread marks every short stretch of driving.
+    fn stamp_tracks(&mut self, i: usize) {
+        let t = &mut self.tanks[i];
         if (t.odometer - t.stamp).abs() > 0.09 {
             t.stamp = t.odometer;
             let (x, y, h) = (t.x, t.y, t.heading);
@@ -600,8 +693,8 @@ impl World {
         }
         let spec = t.spec();
         if self.shells_of(i) >= spec.max_shells {
-            if i == 0 {
-                self.events.push(Event::Empty);
+            if self.is_player(i) {
+                self.events.push(Event::Empty { who: i as u8 });
             }
             return;
         }
@@ -622,7 +715,6 @@ impl World {
         t.muzzle = 0.12;
         t.reveal = 0.6;
         let (ca, sa) = (t.turret.cos(), t.turret.sin());
-        let (mx, my) = (t.x + ca * 0.55, t.y + sa * 0.55);
         let id = self.next_id;
         self.next_id += 1;
         // start inside the tank so a muzzle against a wall still bounces off it
@@ -639,13 +731,8 @@ impl World {
             alive: true,
             puff: 0.0,
         });
-        self.events.push(Event::Shot { rocket: spec.rocket });
-        for _ in 0..4 {
-            let a = t.turret + self.rng.range(-0.6, 0.6);
-            let v = self.rng.range(0.3, 1.2);
-            let life = self.rng.range(0.3, 0.6);
-            self.particles.push(Particle { x: mx, y: my, z: 0.3, vx: a.cos() * v, vy: a.sin() * v, vz: 0.2, life, max: life, size: 0.12, kind: PKind::Smoke });
-        }
+        let (x, y, angle) = (t.x, t.y, t.turret);
+        self.emit(Event::Shot { rocket: spec.rocket, x, y, angle });
     }
 
     fn try_mine(&mut self, i: usize) {
@@ -691,31 +778,12 @@ impl World {
                     s.bounces -= 1;
                     if s.bounces < 0 {
                         s.alive = false;
-                        self.events.push(Event::Fizzle);
-                        self.puff(s.x, s.y, 5, PKind::Smoke);
+                        self.emit(Event::Fizzle { x: s.x, y: s.y });
                         break;
                     }
-                    self.events.push(Event::Bounce);
-                    self.puff(s.x, s.y, 3, PKind::Spark);
+                    self.emit(Event::Bounce { x: s.x, y: s.y });
                 }
                 s.age += h;
-                s.puff += speed * h;
-                if s.puff > if s.rocket { 0.12 } else { 0.22 } {
-                    s.puff = 0.0;
-                    let life = if s.rocket { 0.45 } else { 0.6 };
-                    self.particles.push(Particle {
-                        x: s.x,
-                        y: s.y,
-                        z: 0.25,
-                        vx: 0.0,
-                        vy: 0.0,
-                        vz: 0.15,
-                        life,
-                        max: life,
-                        size: if s.rocket { 0.11 } else { 0.08 },
-                        kind: if s.rocket { PKind::Fire } else { PKind::Smoke },
-                    });
-                }
                 // tanks
                 let reach = (TANK_R + SHELL_R).powi(2);
                 let mut hit = None;
@@ -750,17 +818,42 @@ impl World {
                 if p.alive && q.alive && (p.x - q.x).hypot(p.y - q.y) < SHELL_R * 2.5 {
                     self.shells[a].alive = false;
                     self.shells[b].alive = false;
-                    self.events.push(Event::Cancel);
-                    self.puff((p.x + q.x) / 2.0, (p.y + q.y) / 2.0, 6, PKind::Spark);
+                    self.emit(Event::Cancel { x: (p.x + q.x) / 2.0, y: (p.y + q.y) / 2.0 });
                 }
             }
         }
         self.shells.retain(|s| s.alive);
     }
 
+    /// Smoke (or rocket fire) puffed out behind every shell.
+    fn trails(&mut self, dt: f32) {
+        for k in 0..self.shells.len() {
+            let s = &mut self.shells[k];
+            s.puff += s.vx.hypot(s.vy) * dt;
+            if s.puff <= if s.rocket { 0.12 } else { 0.22 } {
+                continue;
+            }
+            s.puff = 0.0;
+            let life = if s.rocket { 0.45 } else { 0.6 };
+            let p = Particle {
+                x: s.x,
+                y: s.y,
+                z: 0.25,
+                vx: 0.0,
+                vy: 0.0,
+                vz: 0.15,
+                life,
+                max: life,
+                size: if s.rocket { 0.11 } else { 0.08 },
+                kind: if s.rocket { PKind::Fire } else { PKind::Smoke },
+            };
+            self.particles.push(p);
+        }
+    }
+
     fn destroy_tank(&mut self, j: usize) {
         // once the last enemy falls the player cannot lose any more
-        if j == 0 && self.won_t.is_some() {
+        if self.is_player(j) && self.won_t.is_some() {
             return;
         }
         let t = &mut self.tanks[j];
@@ -768,22 +861,11 @@ impl World {
             return;
         }
         t.alive = false;
-        let (x, y, kind) = (t.x, t.y, t.kind);
-        if j != 0 {
-            self.kills.push(t.spawn);
+        let (x, y, kind, spawn) = (t.x, t.y, t.kind, t.spawn);
+        if !self.is_player(j) {
+            self.kills.push(spawn);
         }
-        let body = ai::SPECS[kind].body;
-        self.events.push(Event::TankDown { kind });
-        self.blasts.push(Blast { x, y, age: 0.0, radius: 0.75 });
-        self.scorch_cross(x, y);
-        for _ in 0..10 {
-            let a = self.rng.range(0.0, TAU);
-            let v = self.rng.range(1.0, 3.5);
-            let life = self.rng.range(0.5, 1.0);
-            self.particles.push(Particle { x, y, z: 0.3, vx: a.cos() * v, vy: a.sin() * v, vz: self.rng.range(1.0, 3.0), life, max: life, size: 0.1, kind: PKind::Debris(body) });
-        }
-        self.puff(x, y, 10, PKind::Smoke);
-        self.puff(x, y, 6, PKind::Fire);
+        self.emit(Event::TankDown { kind, x, y });
         log::info!("tank {j} ({}) destroyed", ai::SPECS[kind].name);
     }
 
@@ -827,8 +909,7 @@ impl World {
         }
         self.mines[k].alive = false;
         let (x, y) = (self.mines[k].x, self.mines[k].y);
-        self.events.push(Event::MineBoom);
-        self.blasts.push(Blast { x, y, age: 0.0, radius: MINE_RADIUS });
+        self.emit(Event::MineBoom { x, y });
         for j in 0..self.tanks.len() {
             let t = &self.tanks[j];
             if t.alive && (t.x - x).hypot(t.y - y) < MINE_RADIUS + TANK_R * 0.4 {
@@ -844,15 +925,7 @@ impl World {
             for tx in (x - MINE_RADIUS).floor() as i32..=(x + MINE_RADIUS).floor() as i32 {
                 let (cx, cy) = (x.clamp(tx as f32, tx as f32 + 1.0), y.clamp(ty as f32, ty as f32 + 1.0));
                 if self.arena.tile(tx, ty) == Tile::Crate && (cx - x).hypot(cy - y) < MINE_RADIUS * 0.8 {
-                    self.arena.set(tx, ty, Tile::Floor);
-                    self.events.push(Event::CrateBroken);
-                    for _ in 0..8 {
-                        let a = self.rng.range(0.0, TAU);
-                        let v = self.rng.range(0.5, 2.5);
-                        let life = self.rng.range(0.5, 1.1);
-                        let (px, py) = (tx as f32 + self.rng.f32(), ty as f32 + self.rng.f32());
-                        self.particles.push(Particle { x: px, y: py, z: 0.5, vx: a.cos() * v, vy: a.sin() * v, vz: self.rng.range(1.0, 3.0), life, max: life, size: 0.1, kind: PKind::Debris((214, 176, 120)) });
-                    }
+                    self.emit(Event::CrateBroken { tx, ty });
                     // the paths change
                     self.field_t = 0.0;
                 }
@@ -863,14 +936,141 @@ impl World {
                 self.pending_mines.push(m);
             }
         }
-        // scorch disc
-        let r = MINE_RADIUS * 0.7;
-        self.stain_disc(x, y, r);
-        self.puff(x, y, 18, PKind::Smoke);
-        self.puff(x, y, 10, PKind::Fire);
     }
 
     // -------------------------------------------------------------- effects
+
+    fn emit(&mut self, e: Event) {
+        self.fx(e);
+        self.events.push(e);
+    }
+
+    /// The looks of an event: smoke, sparks, blasts, scorch, debris, and the
+    /// broken crate. Run by whoever draws the battle, host or guest.
+    pub fn fx(&mut self, e: Event) {
+        match e {
+            Event::Shot { x, y, angle, .. } => {
+                let (mx, my) = (x + angle.cos() * 0.55, y + angle.sin() * 0.55);
+                for _ in 0..4 {
+                    let a = angle + self.rng.range(-0.6, 0.6);
+                    let v = self.rng.range(0.3, 1.2);
+                    let life = self.rng.range(0.3, 0.6);
+                    self.particles.push(Particle { x: mx, y: my, z: 0.3, vx: a.cos() * v, vy: a.sin() * v, vz: 0.2, life, max: life, size: 0.12, kind: PKind::Smoke });
+                }
+            }
+            Event::Bounce { x, y } => self.puff(x, y, 3, PKind::Spark),
+            Event::Fizzle { x, y } => self.puff(x, y, 5, PKind::Smoke),
+            Event::Cancel { x, y } => self.puff(x, y, 6, PKind::Spark),
+            Event::TankDown { kind, x, y } => {
+                let body = ai::SPECS[kind.min(ai::SPECS.len() - 1)].body;
+                self.blasts.push(Blast { x, y, age: 0.0, radius: 0.75 });
+                self.scorch_cross(x, y);
+                for _ in 0..10 {
+                    let a = self.rng.range(0.0, TAU);
+                    let v = self.rng.range(1.0, 3.5);
+                    let life = self.rng.range(0.5, 1.0);
+                    self.particles.push(Particle { x, y, z: 0.3, vx: a.cos() * v, vy: a.sin() * v, vz: self.rng.range(1.0, 3.0), life, max: life, size: 0.1, kind: PKind::Debris(body) });
+                }
+                self.puff(x, y, 10, PKind::Smoke);
+                self.puff(x, y, 6, PKind::Fire);
+            }
+            Event::MineBoom { x, y } => {
+                self.blasts.push(Blast { x, y, age: 0.0, radius: MINE_RADIUS });
+                self.stain_disc(x, y, MINE_RADIUS * 0.7);
+                self.puff(x, y, 18, PKind::Smoke);
+                self.puff(x, y, 10, PKind::Fire);
+            }
+            Event::CrateBroken { tx, ty } => {
+                self.arena.set(tx, ty, Tile::Floor);
+                for _ in 0..8 {
+                    let a = self.rng.range(0.0, TAU);
+                    let v = self.rng.range(0.5, 2.5);
+                    let life = self.rng.range(0.5, 1.1);
+                    let (px, py) = (tx as f32 + self.rng.f32(), ty as f32 + self.rng.f32());
+                    self.particles.push(Particle { x: px, y: py, z: 0.5, vx: a.cos() * v, vy: a.sin() * v, vz: self.rng.range(1.0, 3.0), life, max: life, size: 0.1, kind: PKind::Debris((214, 176, 120)) });
+                }
+            }
+            Event::Empty { .. } | Event::MineSet | Event::MineBeep => {}
+        }
+    }
+
+    /// The battle as a guest needs it, with the events since the last one.
+    pub fn snapshot(&self, events: Vec<Event>) -> Snapshot {
+        Snapshot {
+            time: self.time,
+            tanks: self
+                .tanks
+                .iter()
+                .map(|t| TankState {
+                    kind: t.kind as u8,
+                    alive: t.alive,
+                    x: t.x,
+                    y: t.y,
+                    heading: t.heading,
+                    turret: t.turret,
+                    speed: t.speed,
+                    odometer: t.odometer,
+                    muzzle: t.muzzle,
+                    reveal: t.reveal,
+                })
+                .collect(),
+            shells: self.shells.iter().map(|s| ShellState { id: s.id, owner: s.owner as u8, rocket: s.rocket, x: s.x, y: s.y, vx: s.vx, vy: s.vy }).collect(),
+            mines: self.mines.iter().map(|m| MineState { owner: m.owner as u8, x: m.x, y: m.y, fuse: m.fuse }).collect(),
+            events,
+        }
+    }
+
+    /// Guest side: take the host's battle as it is now, and replay the looks
+    /// of what happened since the last snapshot.
+    pub fn apply(&mut self, s: &Snapshot) {
+        let dt = (s.time - self.time).clamp(0.0, 0.1);
+        self.time = s.time;
+        for (k, st) in s.tanks.iter().enumerate() {
+            if k >= self.tanks.len() {
+                let mut t = self.tanks[0].clone();
+                t.stamp = st.odometer;
+                self.tanks.push(t);
+            }
+            let t = &mut self.tanks[k];
+            t.kind = st.kind as usize;
+            t.alive = st.alive;
+            t.x = st.x;
+            t.y = st.y;
+            t.heading = st.heading;
+            t.turret = st.turret;
+            t.speed = st.speed;
+            t.odometer = st.odometer;
+            t.muzzle = st.muzzle;
+            t.reveal = st.reveal;
+            self.stamp_tracks(k);
+        }
+        self.tanks.truncate(s.tanks.len());
+        let old = std::mem::take(&mut self.shells);
+        self.shells = s
+            .shells
+            .iter()
+            .map(|n| Shell {
+                id: n.id,
+                x: n.x,
+                y: n.y,
+                vx: n.vx,
+                vy: n.vy,
+                bounces: 0,
+                owner: n.owner as usize,
+                rocket: n.rocket,
+                age: 1.0,
+                alive: true,
+                // keep each shell's trail spacing across snapshots
+                puff: old.iter().find(|o| o.id == n.id).map_or(0.0, |o| o.puff),
+            })
+            .collect();
+        self.mines = s.mines.iter().map(|m| Mine { x: m.x, y: m.y, owner: m.owner as usize, fuse: m.fuse, armed: true, alive: true, beep: 0.0 }).collect();
+        for &e in &s.events {
+            self.emit(e);
+        }
+        self.trails(dt);
+        self.update_effects(dt);
+    }
 
     fn puff(&mut self, x: f32, y: f32, n: usize, kind: PKind) {
         for _ in 0..n {
@@ -976,6 +1176,21 @@ impl World {
     }
 }
 
+/// Where the second player starts: a free floor tile near the first
+/// player's spawn, two steps above or below when there is room.
+fn second_spawn(m: &Mission) -> (f32, f32) {
+    let (px, py) = (m.player.0 as i32, m.player.1 as i32);
+    let free = |x: i32, y: i32| m.arena.walkable(x, y) && !m.enemies.iter().any(|e| e.1 as i32 == x && e.2 as i32 == y) && (x, y) != (px, py);
+    let preferred = [(0, 2), (0, -2), (1, 2), (1, -2), (2, 0), (0, 3), (0, -3), (2, 2), (2, -2), (0, 1), (0, -1), (1, 0)];
+    let ring = (1..8).flat_map(|r| (-r..=r).flat_map(move |dy| (-r..=r).map(move |dx| (dx, dy))));
+    for (dx, dy) in preferred.into_iter().chain(ring) {
+        if free(px + dx, py + dy) {
+            return ((px + dx) as f32 + 0.5, (py + dy) as f32 + 0.5);
+        }
+    }
+    (m.player.0, m.player.1)
+}
+
 const NEIGHBOURS: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
 
 #[cfg(test)]
@@ -986,7 +1201,7 @@ mod tests {
     #[test]
     fn shell_bounces_then_fizzles() {
         let missions = parse_missions(MISSIONS_TXT).unwrap();
-        let mut w = World::new(&missions[0], &[], 1);
+        let mut w = World::new(&missions[0], &[], 1, 1);
         // remove the enemies so nothing interferes
         for t in &mut w.tanks[1..] {
             t.alive = false;
@@ -995,22 +1210,64 @@ mod tests {
         w.tanks[0].turret = PI / 2.0;
         w.tanks[0].x = 3.5;
         w.tanks[0].y = 4.5;
-        w.step(1.0 / 60.0, Controls { fire: true, ..Default::default() });
+        w.step(1.0 / 60.0, &[Controls { fire: true, ..Default::default() }]);
         assert_eq!(w.shells.len(), 1);
         let mut bounced = 0;
         for _ in 0..600 {
-            w.step(1.0 / 60.0, Controls::default());
-            bounced += w.events.drain(..).filter(|e| *e == Event::Bounce).count();
+            w.step(1.0 / 60.0, &[]);
+            bounced += w.events.drain(..).filter(|e| matches!(e, Event::Bounce { .. })).count();
         }
         assert_eq!(bounced, 1, "a standard shell bounces once");
         assert!(w.shells.is_empty(), "and then it is gone");
     }
 
     #[test]
+    fn second_player_spawns_on_free_floor_everywhere() {
+        for m in parse_missions(MISSIONS_TXT).unwrap() {
+            let w = World::new(&m, &[], 1, 2);
+            let (a, b) = (&w.tanks[0], &w.tanks[1]);
+            assert_eq!(b.kind, P2_KIND);
+            assert!(w.arena.walkable(b.x as i32, b.y as i32), "{}", m.name);
+            assert!((a.x - b.x).hypot(a.y - b.y) >= 1.0, "{}: players overlap", m.name);
+            for e in w.enemies() {
+                assert!((e.x - b.x).hypot(e.y - b.y) >= 1.0, "{}: P2 on an enemy", m.name);
+            }
+        }
+    }
+
+    #[test]
+    fn guest_mirrors_the_host() {
+        let missions = parse_missions(MISSIONS_TXT).unwrap();
+        let m = &missions[13];
+        let mut host = World::new(m, &[], 5, 2);
+        let mut guest = World::new(m, &[], 99, 2);
+        let fire = Controls { fire: true, mine: true, aim_dir: Some(0.3), mv: (1.0, 0.0), ..Default::default() };
+        for k in 0..900 {
+            let c = if k % 30 == 0 { fire } else { Controls { mv: (0.0, 1.0), ..Default::default() } };
+            host.step(1.0 / 60.0, &[c, c]);
+            let events = std::mem::take(&mut host.events);
+            guest.apply(&host.snapshot(events));
+            guest.events.clear();
+            assert_eq!(guest.tanks.len(), host.tanks.len());
+            for (g, h) in guest.tanks.iter().zip(&host.tanks) {
+                assert_eq!((g.alive, g.x, g.y, g.turret), (h.alive, h.x, h.y, h.turret));
+            }
+            assert_eq!(guest.shells.len(), host.shells.len());
+            assert_eq!(guest.mines.len(), host.mines.len());
+        }
+        // broken crates and stains follow too
+        for ty in 0..GH as i32 {
+            for tx in 0..GW as i32 {
+                assert_eq!(guest.arena.tile(tx, ty), host.arena.tile(tx, ty));
+            }
+        }
+    }
+
+    #[test]
     fn every_enemy_can_reach_or_is_stationary() {
         for (n, m) in parse_missions(MISSIONS_TXT).unwrap().iter().enumerate() {
-            let w = World::new(m, &[], 1);
-            for t in &w.tanks[1..] {
+            let w = World::new(m, &[], 1, 2);
+            for t in w.enemies() {
                 if t.spec().speed > 0.0 {
                     let f = &w.player_field;
                     let v = f[t.y as usize * GW + t.x as usize];
@@ -1032,7 +1289,7 @@ mod balance {
         let p = &w.tanks[0];
         let mut c = Controls::default();
         // aim at whatever the shell would hit, else the nearest enemy
-        let target = w.tanks.iter().enumerate().skip(1).filter(|(_, t)| t.alive && !(t.spec().invisible && t.reveal <= 0.0)).min_by(|a, b| {
+        let target = w.tanks.iter().enumerate().skip(w.players).filter(|(_, t)| t.alive && !(t.spec().invisible && t.reveal <= 0.0)).min_by(|a, b| {
             let da = (a.1.x - p.x).hypot(a.1.y - p.y);
             let db = (b.1.x - p.x).hypot(b.1.y - p.y);
             da.total_cmp(&db)
@@ -1077,13 +1334,13 @@ mod balance {
                 let mut gone: Vec<usize> = Vec::new();
                 let mut lives = 3;
                 loop {
-                    let mut w = World::new(m, &gone, seed * 31 + 7);
+                    let mut w = World::new(m, &gone, seed * 31 + 7, 1);
                     let mut t = 0.0;
                     while w.outcome().is_none() && t < 120.0 {
                         let c = bot(&w);
                         let before: Vec<(usize, usize)> = w.shells.iter().map(|s| (s.id as usize, s.owner)).collect();
                         let alive = w.tanks[0].alive;
-                        w.step(1.0 / 60.0, c);
+                        w.step(1.0 / 60.0, &[c]);
                         if alive && !w.tanks[0].alive {
                             // who did it: the shell that vanished, or a mine
                             let gone_now: Vec<usize> = before.iter().filter(|(id, _)| !w.shells.iter().any(|s| s.id as usize == *id)).map(|(_, o)| w.tanks[*o].spec().name.len()).collect();

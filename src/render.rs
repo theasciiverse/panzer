@@ -432,7 +432,7 @@ pub fn paint_tank(cv: &mut Canvas, p: Pose) {
     });
 }
 
-pub fn draw_world(cv: &mut Canvas, w: &World, aim: Option<(f32, f32)>, aim_line: bool) {
+pub fn draw_world(cv: &mut Canvas, w: &World, me: usize, aim: Option<(f32, f32)>, aim_line: bool) {
     cv.fill(|x, ys, ps, h| background(w, x, ys, ps, h));
     let t = w.time;
     // shadows first, so everything stands on them
@@ -538,7 +538,7 @@ pub fn draw_world(cv: &mut Canvas, w: &World, aim: Option<(f32, f32)>, aim_line:
         });
     }
     // the aim: a dotted line from the barrel to the pointer, as in the original
-    let p = &w.tanks[0];
+    let p = &w.tanks[me.min(w.tanks.len() - 1)];
     if p.alive && aim_line {
         let ty = p.y - TURRET_Z * LIFT;
         let (tx, tyy, max) = match aim {
@@ -549,7 +549,7 @@ pub fn draw_world(cv: &mut Canvas, w: &World, aim: Option<(f32, f32)>, aim_line:
         let end = w.ray_to_wall(p.x, p.y, ang, max);
         let len = (end.0 - p.x).hypot(end.1 - p.y);
         let mut d = 0.7;
-        let blue = (40, 84, 200);
+        let blue = scale(p.spec().body, 0.85);
         while d < len {
             let (dx, dy) = (p.x + ang.cos() * d, ty + ang.sin() * d);
             cv.paint(dx, dy, 0.1, OVERLAY_D, false, |x, y| ((x - dx).hypot(y - dy) <= 0.05).then_some((blue, true)));
@@ -646,9 +646,9 @@ pub fn draw_title(buf: &mut Buffer, area: Rect, time: f32) {
 }
 
 /// A full-screen canvas with the arena drawn, for screens over the battle.
-pub fn draw_arena(buf: &mut Buffer, layout: &Layout, w: &World, aim: Option<(f32, f32)>, aim_line: bool, dim: Option<f32>) {
+pub fn draw_arena(buf: &mut Buffer, layout: &Layout, w: &World, me: usize, aim: Option<(f32, f32)>, aim_line: bool, dim: Option<f32>) {
     let mut cv = Canvas::new(layout);
-    draw_world(&mut cv, w, aim, aim_line);
+    draw_world(&mut cv, w, me, aim, aim_line);
     if let Some(k) = dim {
         cv.dim(k);
     }

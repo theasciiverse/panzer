@@ -70,7 +70,10 @@ Playable from title to credits:
 - Keyboard, mouse and twin-stick gamepad. Session logging per the
   Asciiverse convention.
 
-Not built yet: two players, a mission editor, a sextant renderer for small
+- Two-player co-op over the LAN (iroh), found automatically, see
+  Multiplayer.
+
+Not built yet: versus mode, a mission editor, a sextant renderer for small
 terminals (see Next).
 
 ## Running
@@ -79,6 +82,8 @@ terminals (see Next).
 cargo run --release                 # title screen
 cargo run --release -- --mission 9  # straight into a mission
 cargo run --release -- --mute
+cargo run --release -- --host       # host a LAN game (or pick it on the title)
+cargo run --release -- --join       # find LAN games; --join ID dials an iroh id directly
 RUST_LOG=debug ./target/release/panzer 2>panzer.log   # session log
 ```
 
@@ -115,6 +120,38 @@ included, and pulling the trigger when that path ends in the player and not
 in a friend. Movement uses breadth-first path fields over the tile grid.
 Friendly fire is real, as in the original.
 
+## Multiplayer (built 2026-10-04)
+
+Two-player co-op through the campaign, one machine each (split screen was
+ruled out: the arena already needs every pixel). Player 2 drives a red tank
+spawned next to player 1; the spare tanks are shared and a mission fails only
+when both tanks are down. Enemies go for the nearest living player.
+
+- **Host-authoritative.** The host runs the only simulation. The guest sends
+  its `Controls` every tick (fire and mine presses are kept until the host
+  uses them) and menu presses (confirm, pause). The host sends a `Frame`
+  every tick: the campaign state plus a `world::Snapshot` (tanks, shells,
+  mines, and the events since the last frame). The guest replays the events
+  through `World::fx`, so smoke, sparks, blasts, scorch, broken crates and
+  sounds match, and stamps its own tread marks. A full frame is under 2.5 kB.
+  Chosen over lockstep because the sim leans on sin/cos/atan2, which are not
+  guaranteed bit-identical across platforms.
+- **Network code is Tetrix's** (`src/lan.rs`, `src/net.rs`): a UDP beacon on
+  port 31458 for discovery (iroh cannot browse), iroh/QUIC for the
+  connection, postcard frames, 6 s idle timeout. Works with no internet.
+- **Flow:** title menu Host / Join; the host's lobby picks the mission and
+  starts (alone if nobody joined); the guest's screen follows the host's
+  phase. Joining is refused once a campaign is under way. Host Esc from
+  pause or game over returns to the lobby with the guest still connected.
+
+Verified 2026-10-04 with two processes on one machine over real iroh:
+discovery, lobby, mission start, guest driving and firing seen identically on
+both screens, guest pause and resume, host quitting (guest back at the title
+within about a second), guest killed (host notices in 6 s and plays on).
+Tests: `guest_mirrors_the_host` runs 900 ticks of a two-player battle with
+mines and checks the guest matches tank for tank, shell for shell, tile for
+tile. Not yet tried across two physical machines.
+
 ## Design decisions (the old open questions)
 
 - **Rendering:** everything is half-block pixels (`▀`, two freely coloured
@@ -133,7 +170,7 @@ Friendly fire is real, as in the original.
 - **Arena and weapons:** 22x16 tiles inside a fixed border, one-hit kills,
   five shells and two mines for the player, no pickups (the original had
   none either).
-- **v1 scope:** single-player campaign. Multiplayer is still open.
+- **v1 scope:** single-player campaign, then LAN co-op (above).
 
 ## References (checked 2026-10-04)
 
@@ -160,6 +197,8 @@ publicly known, with original names, maps, art and music.
 - `src/game.rs`: campaign flow, HUD, cards.
 - `src/audio.rs`: the synthesiser.
 - `src/input.rs`: keyboard, mouse, gamepad.
+- `src/proto.rs`: wire messages; `src/lan.rs`, `src/net.rs`: discovery and
+  iroh, from Tetrix.
 - `tools/ansi2png.py`: turns a `tmux capture-pane -e -p` dump into a PNG.
 
 ## Verifying
@@ -180,7 +219,8 @@ killed the default tmux server mid-run.
 
 ## Next
 
-- Two players: second keyboard half or a second pad locally, then iroh.
+- Two physical machines on a real LAN (and Wi-Fi that may block broadcast).
+- Versus mode on the same network code, in arenas built for two.
 - Sextant (2x3) rendering for small terminals, picked with `drawprobe`.
 - A mission editor, like Calvary's `--edit`.
 - Tune the campaign against human play (the bot is only a smoke test).
