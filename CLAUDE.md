@@ -174,7 +174,7 @@ tile. Not yet tried across two physical machines.
 
 ## References (checked 2026-10-04)
 
-`asciiverse/references/Wii Tanks/`:
+`../../references/Wii Tanks/`:
 
 - `Wii Tank Battle.zip`: an SVN checkout of tank-battle-wii.googlecode.com
   (2008). It holds only the GRRLIB and libpng libraries and a Makefile;
