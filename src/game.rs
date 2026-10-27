@@ -1012,7 +1012,7 @@ impl Game {
         }
         lines.push(Line::from(""));
         lines.push(Line::styled("Up/Down: choose    Left/Right: mission    Space: go    H: help    Esc: quit", Style::new().fg(DIM)));
-        lines.push(Line::styled("An Asciiverse game, after Wii Play Tanks (Nintendo, 2006)", Style::new().fg(DIM)));
+        lines.push(Line::styled("After Wii Play Tanks (Nintendo, 2006)", Style::new().fg(DIM)));
         let h = lines.len() as u16 + 2;
         let w = 84.min(full.width);
         let area = Rect { x: full.x + (full.width - w) / 2, y: full.y + full.height * 46 / 100, width: w, height: h.min(full.height) };
