@@ -10,9 +10,19 @@ engine voice and their own instrument in the battle march, from the Tinpot
 that can't move to the Ghost you can only hear. Bring a friend on the local
 network for co-op, and mind the friendly fire.
 
+## Play
+
+With [av](https://asciiverse.sh), the Asciiverse client:
+
 ```
-cargo run --release
+av install panzer
+av play panzer
 ```
+
+Or download the archive for your system from this repository's Releases,
+unpack it and run `./panzer` (`panzer.exe` on Windows).
+
+To build it yourself: `cargo run --release`.
 
 Needs a truecolour terminal: 160x50 is playable, 200x60 or more is
 comfortable.
