@@ -53,3 +53,7 @@ Session log for bug reports: `RUST_LOG=debug panzer 2>panzer.log`
 After Wii Play Tanks (Nintendo, 2006): original names, maps, art and music,
 no code or art from it. Music and sound are synthesised in the game.
 Networking uses [iroh](https://iroh.computer).
+
+## Licence
+
+MIT; see [LICENSE](LICENSE).
