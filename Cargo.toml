@@ -1,6 +1,6 @@
 [package]
 name = "panzer"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "Asciiverse top-down toy tank combat with ricochets, mines and adaptive music, Rust + Ratatui"
