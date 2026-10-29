@@ -1,0 +1,158 @@
+# Builds Panzer for the Asciiverse catalog: one archive per target,
+# named <id>-<target>.tar.gz (Linux, macOS) or .zip (Windows), plus a
+# SHA256SUMS file, attached to a GitHub release (hub/catalog/SCHEMA.md,
+# release.source = "github").
+#
+# On the pattern of Braillestorm's. Tags look like v1.0.0. Linux builds
+# are glibc, not static musl: sound goes through rodio's ALSA output and
+# gamepads through gilrs and udev, both linked dynamically, so the binary
+# needs libasound2 and libudev1 (the manifest's system_deps).
+# They are built on Ubuntu 22.04, so they run on glibc 2.35 and newer.
+# macOS and Windows use rodio's own output (Core Audio, WASAPI) and their
+# own gamepad APIs. The archives carry
+# README.md and LICENSE.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build and release"
+        required: true
+
+env:
+  ID: panzer
+  BIN: panzer
+  TAG: ${{ inputs.tag || github.ref_name }}
+  LICENCE_FILE: LICENSE
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+          rustup update stable && rustup default stable
+          cargo build --release --locked
+          strip target/release/$BIN
+          file target/release/$BIN
+          # libc, libm, libgcc_s, and the two the manifest declares
+          ldd target/release/$BIN
+          ! ldd target/release/$BIN | grep -v -E 'linux-vdso|libc\.so|libm\.so|libgcc_s|ld-linux|libasound|libudev'
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Package for av
+        run: |
+          # the binary sits at the top of the archive, where av looks for it
+          mkdir -p stage dist
+          cp target/release/$BIN README.md $LICENCE_FILE stage/
+          tar -czf "dist/$ID-${{ matrix.target }}.tar.gz" -C stage .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build
+        run: |
+          rustup update stable && rustup default stable
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
+          strip target/${{ matrix.target }}/release/$BIN
+          file target/${{ matrix.target }}/release/$BIN
+
+      - name: Package
+        run: |
+          mkdir -p stage dist
+          cp target/${{ matrix.target }}/release/$BIN README.md $LICENCE_FILE stage/
+          tar -czf "dist/$ID-${{ matrix.target }}.tar.gz" -C stage .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build
+        shell: bash
+        run: |
+          rustup update stable && rustup default stable
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p stage dist
+          cp target/${{ matrix.target }}/release/$BIN.exe README.md $LICENCE_FILE stage/
+          (cd stage && 7z a -tzip "../dist/$ID-${{ matrix.target }}.zip" .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Panzer $TAG" \
+                 --notes "Panzer $TAG for the Asciiverse catalog. Its README lists the controls."
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber
