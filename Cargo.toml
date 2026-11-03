@@ -1,6 +1,6 @@
 [package]
 name = "panzer"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "MIT"
 description = "Asciiverse top-down toy tank combat with ricochets, mines and adaptive music, Rust + Ratatui"
@@ -14,7 +14,7 @@ ratatui = "0.30"
 log = "0.4"
 env_logger = "0.11"
 rodio = { version = "0.22", default-features = false, features = ["playback"] }
-gilrs = { version = "0.11", optional = true }
+gilrs = { version = "0.11", optional = true, default-features = false, features = ["xinput"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 iroh = "1.0.2"
